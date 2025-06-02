@@ -2,8 +2,8 @@
   "name": "uni-bridge",
   "displayName": "UniBridge",
   "description": "TCP bridge between Unity and VS Code for seamless two‐way communication.",
-  "version": "0.0.1",
-  "publisher": "workshop2d",        
+  "version": "0.0.2",
+  "publisher": "workshop2d",
   "engines": {
     "vscode": "^1.100.0"
   },
@@ -14,7 +14,7 @@
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
-  "icon": "images/icon.png",               
+  "icon": "images/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/workshop2d/uni-bridge.git"
