@@ -1,0 +1,71 @@
+{
+  "name": "uni-bridge",
+  "displayName": "UniBridge",
+  "description": "TCP bridge between Unity and VS Code for seamless two‐way communication (batch renames, symbol lookups, etc.).",
+  "version": "0.0.1",
+  "publisher": "workshop2d",        
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "icon": "images/icon.png",               
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/workshop2d/uni-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/workshop2d/uni-bridge/issues"
+  },
+  "homepage": "https://github.com/workshop2d/uni-bridge#readme",
+  "contributes": {
+    "configuration": {
+      "type": "object",
+      "title": "UniBridge Configuration",
+      "properties": {
+        "uniBridge.port": {
+          "type": "number",
+          "default": 39217,
+          "description": "TCP port on localhost where UniBridge listens for Unity messages."
+        },
+        "uniBridge.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host address for the UniBridge TCP server (usually localhost)."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "uniBridge.startServer",
+        "title": "UniBridge: Start TCP Server"
+      },
+      {
+        "command": "uniBridge.stopServer",
+        "title": "UniBridge: Stop TCP Server"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext .ts",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.100.0",
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.31.1",
+    "@typescript-eslint/parser": "^8.31.1",
+    "eslint": "^9.25.1",
+    "typescript": "^5.8.3",
+    "@vscode/test-electron": "^2.5.2"
+  }
+}
