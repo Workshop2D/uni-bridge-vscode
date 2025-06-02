@@ -47,8 +47,11 @@ interface RenameRequest {
 
 ### Unity Side
 
+Unity Side is handled by Unity Assets Store asset: UniBridge "<link>"
+
 - Use the provided `UniBridgeClient` static class in Unity to send rename requests.
 - Configure host and port (default: `127.0.0.1:39217`) to match your VS Code extension settings.
+- Handle responses
 - Example rename request:
 
 ```csharp
