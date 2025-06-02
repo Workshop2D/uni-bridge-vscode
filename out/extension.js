@@ -52,6 +52,7 @@ function activate(context) {
                     const currentRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
                     if (req.projectRoot && currentRoot !== req.projectRoot) {
                         const errorResp = {
+                            requestId: req.requestId,
                             status: "error",
                             message: `Mismatched project root: expected '${currentRoot}', got '${req.projectRoot}'`,
                             projectRoot: req.projectRoot,
@@ -62,6 +63,7 @@ function activate(context) {
                     if (req.action === "rename") {
                         handleRename(req).then(() => {
                             const okResp = {
+                                requestId: req.requestId,
                                 status: "ok",
                                 projectRoot: req.projectRoot ?? currentRoot
                             };
@@ -72,6 +74,7 @@ function activate(context) {
                         }).catch(renErr => {
                             const message = renErr instanceof Error ? renErr.message : String(renErr);
                             const errorPayload = {
+                                requestId: req.requestId,
                                 status: "error",
                                 message,
                                 projectRoot: req.projectRoot ?? currentRoot
@@ -84,6 +87,7 @@ function activate(context) {
                     }
                     else {
                         const errorResp = {
+                            requestId: req.requestId,
                             status: "error",
                             message: "Unknown action",
                             projectRoot: req.projectRoot ?? currentRoot
@@ -93,7 +97,7 @@ function activate(context) {
                 }
                 catch (e) {
                     console.error("[scriptEdit] JSON parse error:", e);
-                    // ignore malformed or partial JSON — will wait for more data
+                    // ignore malformed or partial JSON
                 }
             }
         });
@@ -101,7 +105,7 @@ function activate(context) {
             console.error("[scriptEdit] Socket error:", err);
         });
         socket.on("close", () => {
-            // Optional: handle socket close if needed
+            // Optional
         });
     });
     server.listen(39217, "127.0.0.1", () => {

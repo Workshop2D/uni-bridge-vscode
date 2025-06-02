@@ -3,6 +3,7 @@ import * as net from "net";
 
 interface RenameRequest {
   action: "rename";
+  requestId: string;
   oldNamespace?: string;
   newNamespace?: string;
   oldClass?: string;
@@ -14,6 +15,7 @@ interface RenameRequest {
 }
 
 interface UnityResponse {
+  requestId: string;
   status: "ok" | "error";
   message?: string;
   projectRoot: string;
@@ -39,6 +41,7 @@ export function activate(context: vscode.ExtensionContext) {
           const currentRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
           if (req.projectRoot && currentRoot !== req.projectRoot) {
             const errorResp: UnityResponse = {
+              requestId: req.requestId,
               status: "error",
               message: `Mismatched project root: expected '${currentRoot}', got '${req.projectRoot}'`,
               projectRoot: req.projectRoot,
@@ -50,6 +53,7 @@ export function activate(context: vscode.ExtensionContext) {
           if (req.action === "rename") {
             handleRename(req).then(() => {
               const okResp: UnityResponse = {
+                requestId: req.requestId,
                 status: "ok",
                 projectRoot: req.projectRoot ?? currentRoot
               };
@@ -61,6 +65,7 @@ export function activate(context: vscode.ExtensionContext) {
             }).catch(renErr => {
               const message = renErr instanceof Error ? renErr.message : String(renErr);
               const errorPayload: UnityResponse = {
+                requestId: req.requestId,
                 status: "error",
                 message,
                 projectRoot: req.projectRoot ?? currentRoot
@@ -72,6 +77,7 @@ export function activate(context: vscode.ExtensionContext) {
             });
           } else {
             const errorResp: UnityResponse = {
+              requestId: req.requestId,
               status: "error",
               message: "Unknown action",
               projectRoot: req.projectRoot ?? currentRoot
@@ -80,7 +86,7 @@ export function activate(context: vscode.ExtensionContext) {
           }
         } catch (e) {
           console.error("[scriptEdit] JSON parse error:", e);
-          // ignore malformed or partial JSON — will wait for more data
+          // ignore malformed or partial JSON
         }
       }
     });
@@ -90,7 +96,7 @@ export function activate(context: vscode.ExtensionContext) {
     });
 
     socket.on("close", () => {
-      // Optional: handle socket close if needed
+      // Optional
     });
   });
 
@@ -121,7 +127,7 @@ async function doLspRename(oldSym: string, newSym: string) {
   )) || [];
 
   const match = symbols.find(si => si.name === oldSym);
-  if (!match) {throw new Error(`Symbol '${oldSym}' not found.`);}
+  if (!match) { throw new Error(`Symbol '${oldSym}' not found.`); }
 
   const edit = await vscode.commands.executeCommand<vscode.WorkspaceEdit>(
     "vscode.executeDocumentRenameProvider",
@@ -130,10 +136,10 @@ async function doLspRename(oldSym: string, newSym: string) {
     newSym
   );
 
-  if (!edit) {throw new Error(`Rename of '${oldSym}' failed (no edits).`);}
+  if (!edit) { throw new Error(`Rename of '${oldSym}' failed (no edits).`); }
 
   const applied = await vscode.workspace.applyEdit(edit);
-  if (!applied) {throw new Error(`Rename of '${oldSym}' failed on applyEdit.`);}
+  if (!applied) { throw new Error(`Rename of '${oldSym}' failed on applyEdit.`); }
 
   await vscode.workspace.saveAll();
 }
