@@ -1,7 +1,7 @@
 {
   "name": "uni-bridge",
   "displayName": "UniBridge",
-  "description": "TCP bridge between Unity and VS Code for seamless two‐way communication (batch renames, symbol lookups, etc.).",
+  "description": "TCP bridge between Unity and VS Code for seamless two‐way communication.",
   "version": "0.0.1",
   "publisher": "workshop2d",        
   "engines": {

@@ -25,68 +25,77 @@ export function activate(context: vscode.ExtensionContext) {
   server = net.createServer(socket => {
     let dataBuffer = "";
 
-    socket.on("data", async chunk => {
+    socket.on("data", chunk => {
       dataBuffer += chunk.toString();
 
-      try {
-        const req = JSON.parse(dataBuffer) as RenameRequest;
-        dataBuffer = "";
+      let newlineIndex: number;
+      while ((newlineIndex = dataBuffer.indexOf("\n")) !== -1) {
+        const message = dataBuffer.slice(0, newlineIndex);
+        dataBuffer = dataBuffer.slice(newlineIndex + 1);
 
-        const currentRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        if (req.projectRoot && currentRoot !== req.projectRoot) {
-          socket.write(JSON.stringify({
-            status: "error",
-            message: `Mismatched project root: expected '${currentRoot}', got '${req.projectRoot}'`,
-            projectRoot: req.projectRoot,
-          } satisfies UnityResponse));
-          return;
-        }
+        try {
+          const req = JSON.parse(message) as RenameRequest;
 
-        if (req.action === "rename") {
-          try {
-            await handleRename(req);
-            socket.write(JSON.stringify({
-              status: "ok",
-              projectRoot: req.projectRoot ?? currentRoot ?? ""
-            } satisfies UnityResponse));
-
-            if (req.unityPort) {
-              sendResponseToUnity({
-                status: "ok",
-                projectRoot: req.projectRoot ?? currentRoot ?? ""
-              }, req.unityPort);
-            }
-          } catch (renErr) {
-            const message = renErr instanceof Error ? renErr.message : String(renErr);
-            const errorPayload: UnityResponse = {
+          const currentRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
+          if (req.projectRoot && currentRoot !== req.projectRoot) {
+            const errorResp: UnityResponse = {
               status: "error",
-              message,
-              projectRoot: req.projectRoot ?? currentRoot ?? ""
+              message: `Mismatched project root: expected '${currentRoot}', got '${req.projectRoot}'`,
+              projectRoot: req.projectRoot,
             };
-            socket.write(JSON.stringify(errorPayload));
-            if (req.unityPort) {
-              sendResponseToUnity(errorPayload, req.unityPort);
-            }
+            socket.write(JSON.stringify(errorResp) + "\n");
+            continue;
           }
-        } else {
-          socket.write(JSON.stringify({
-            status: "error",
-            message: "Unknown action",
-            projectRoot: req.projectRoot ?? currentRoot ?? ""
-          } satisfies UnityResponse));
+
+          if (req.action === "rename") {
+            handleRename(req).then(() => {
+              const okResp: UnityResponse = {
+                status: "ok",
+                projectRoot: req.projectRoot ?? currentRoot
+              };
+              socket.write(JSON.stringify(okResp) + "\n");
+
+              if (req.unityPort) {
+                sendResponseToUnity(okResp, req.unityPort);
+              }
+            }).catch(renErr => {
+              const message = renErr instanceof Error ? renErr.message : String(renErr);
+              const errorPayload: UnityResponse = {
+                status: "error",
+                message,
+                projectRoot: req.projectRoot ?? currentRoot
+              };
+              socket.write(JSON.stringify(errorPayload) + "\n");
+              if (req.unityPort) {
+                sendResponseToUnity(errorPayload, req.unityPort);
+              }
+            });
+          } else {
+            const errorResp: UnityResponse = {
+              status: "error",
+              message: "Unknown action",
+              projectRoot: req.projectRoot ?? currentRoot
+            };
+            socket.write(JSON.stringify(errorResp) + "\n");
+          }
+        } catch (e) {
+          console.error("[scriptEdit] JSON parse error:", e);
+          // ignore malformed or partial JSON — will wait for more data
         }
-      } catch {
-        // Buffer incomplete
       }
     });
 
     socket.on("error", err => {
       console.error("[scriptEdit] Socket error:", err);
     });
+
+    socket.on("close", () => {
+      // Optional: handle socket close if needed
+    });
   });
 
   server.listen(39217, "127.0.0.1", () => {
-    console.log("[scriptEdit] Listening on ws://127.0.0.1:39217");
+    console.log("[scriptEdit] Listening on tcp://127.0.0.1:39217");
   });
 
   context.subscriptions.push({ dispose: () => server.close() });
@@ -112,8 +121,8 @@ async function doLspRename(oldSym: string, newSym: string) {
   )) || [];
 
   const match = symbols.find(si => si.name === oldSym);
-  if (!match) {throw new Error(`Symbol '${oldSym}' not found.`);
-}
+  if (!match) {throw new Error(`Symbol '${oldSym}' not found.`);}
+
   const edit = await vscode.commands.executeCommand<vscode.WorkspaceEdit>(
     "vscode.executeDocumentRenameProvider",
     match.location.uri,
@@ -122,15 +131,17 @@ async function doLspRename(oldSym: string, newSym: string) {
   );
 
   if (!edit) {throw new Error(`Rename of '${oldSym}' failed (no edits).`);}
+
   const applied = await vscode.workspace.applyEdit(edit);
   if (!applied) {throw new Error(`Rename of '${oldSym}' failed on applyEdit.`);}
+
   await vscode.workspace.saveAll();
 }
 
 function sendResponseToUnity(response: UnityResponse, port: number) {
   const client = new net.Socket();
   client.connect(port, "127.0.0.1", () => {
-    client.write(JSON.stringify(response));
+    client.write(JSON.stringify(response) + "\n");
     client.end();
   });
   client.on("error", err => {
