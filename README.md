@@ -28,6 +28,23 @@ This integration facilitates:
 
 ## Usage
 
+### Extension Side
+
+- Currently implemented:
+
+interface RenameRequest {
+  action: "rename";
+  requestId: string;
+  oldNamespace?: string;
+  newNamespace?: string;
+  oldClass?: string;
+  newClass?: string;
+  oldFile?: string;
+  newFile?: string;
+  unityPort?: number;
+  projectRoot?: string;
+}
+
 ### Unity Side
 
 - Use the provided `UniBridgeClient` static class in Unity to send rename requests.
