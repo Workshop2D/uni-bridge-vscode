@@ -37,6 +37,8 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const net = __importStar(require("net"));
+const fs = __importStar(require("fs"));
+const path = __importStar(require("path"));
 let server = null;
 let listeningPort = null;
 let isDisposed = false;
@@ -48,14 +50,13 @@ function activate(context) {
         return new Promise((resolve, reject) => {
             const s = net.createServer(onSocket);
             s.once("error", (err) => {
-                // Bind error—close & reject
                 if (err.code !== "EADDRINUSE" && err.code !== "EACCES") {
                     console.error(`[scriptEdit] Unexpected listen() error on port ${port}:`, err);
                 }
                 try {
                     s.close();
                 }
-                catch { /* no-op */ }
+                catch { }
                 reject(err);
             });
             s.once("listening", () => {
@@ -79,9 +80,8 @@ function activate(context) {
                 }
                 catch (e) {
                     console.error("[scriptEdit] JSON parse error:", e);
-                    continue; // malformed JSON—ignore
+                    continue;
                 }
-                // ── 1) If it’s a “handshake” probe, answer immediately and close
                 if (generic.action === "handshake") {
                     const handshakeResponse = {
                         status: "ok",
@@ -91,7 +91,6 @@ function activate(context) {
                     socket.end();
                     continue;
                 }
-                // ── 2) Otherwise, treat it as a “rename” request
                 if (generic.action === "rename") {
                     const req = generic;
                     const currentRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
@@ -115,6 +114,7 @@ function activate(context) {
                         if (req.unityPort) {
                             sendResponseToUnity(okResp, req.unityPort);
                         }
+                        writeTempFile(okResp);
                     })
                         .catch((renErr) => {
                         const msg = renErr instanceof Error ? renErr.message : String(renErr);
@@ -128,10 +128,10 @@ function activate(context) {
                         if (req.unityPort) {
                             sendResponseToUnity(errorPayload, req.unityPort);
                         }
+                        writeTempFile(errorPayload);
                     });
                 }
                 else {
-                    // Unknown action—reply with error
                     const errorResp = {
                         status: "error",
                         message: "Unknown action"
@@ -232,13 +232,25 @@ function sendResponseToUnity(response, port) {
         console.error("[scriptEdit] Send‐back error:", err);
     });
 }
+function writeTempFile(response) {
+    const tempDir = path.join(require("os").tmpdir(), "vscode-scriptEdit");
+    try {
+        fs.mkdirSync(tempDir, { recursive: true });
+        const outPath = path.join(tempDir, `last_response.json`);
+        fs.writeFileSync(outPath, JSON.stringify(response, null, 2), "utf8");
+        console.log(`[scriptEdit] Wrote response to temp file: ${outPath}`);
+    }
+    catch (err) {
+        console.error("[scriptEdit] Failed to write temp file:", err);
+    }
+}
 function deactivate() {
     isDisposed = true;
     if (server) {
         try {
             server.close();
         }
-        catch { /* no-op */ }
+        catch { }
     }
 }
 //# sourceMappingURL=extension.js.map
