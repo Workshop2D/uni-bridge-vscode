@@ -131,13 +131,17 @@ export function activate(context: vscode.ExtensionContext) {
             continue;
           }
 
+          // Normalize extension’s workspace root to match Unity’s style:
+          let wsRootNorm = root.replace(/\\/g, "/").replace(/\/$/, "");
+          wsRootNorm = wsRootNorm.toLowerCase();
+
           const handshakeResponse: UnityResponse = {
             status: "ok",
             message: "handshake-ack",
-            projectRoot: wsRootRaw
+            projectRoot: wsRootNorm
           };
           socket.write(JSON.stringify(handshakeResponse) + "\n");
-          socket.end();
+
           continue;
         }
 
