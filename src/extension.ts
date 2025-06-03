@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 import * as net from "net";
+import * as fs from "fs";
+import * as path from "path";
 
 interface RenameRequest {
   action: "handshake" | "rename";
@@ -35,11 +37,10 @@ export function activate(context: vscode.ExtensionContext) {
       const s = net.createServer(onSocket);
 
       s.once("error", (err: NodeJS.ErrnoException) => {
-        // Bind error—close & reject
         if (err.code !== "EADDRINUSE" && err.code !== "EACCES") {
           console.error(`[scriptEdit] Unexpected listen() error on port ${port}:`, err);
         }
-        try { s.close(); } catch { /* no-op */ }
+        try { s.close(); } catch {}
         reject(err);
       });
 
@@ -68,10 +69,9 @@ export function activate(context: vscode.ExtensionContext) {
           generic = JSON.parse(message);
         } catch (e) {
           console.error("[scriptEdit] JSON parse error:", e);
-          continue; // malformed JSON—ignore
+          continue;
         }
 
-        // ── 1) If it’s a “handshake” probe, answer immediately and close
         if (generic.action === "handshake") {
           const handshakeResponse: UnityResponse = {
             status: "ok",
@@ -82,10 +82,8 @@ export function activate(context: vscode.ExtensionContext) {
           continue;
         }
 
-        // ── 2) Otherwise, treat it as a “rename” request
         if (generic.action === "rename") {
           const req = generic as RenameRequest;
-
           const currentRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
           if (req.projectRoot && currentRoot !== req.projectRoot) {
             const errorResp: UnityResponse = {
@@ -108,6 +106,7 @@ export function activate(context: vscode.ExtensionContext) {
               if (req.unityPort) {
                 sendResponseToUnity(okResp, req.unityPort);
               }
+              writeTempFile(okResp);
             })
             .catch((renErr) => {
               const msg = renErr instanceof Error ? renErr.message : String(renErr);
@@ -121,10 +120,9 @@ export function activate(context: vscode.ExtensionContext) {
               if (req.unityPort) {
                 sendResponseToUnity(errorPayload, req.unityPort);
               }
+              writeTempFile(errorPayload);
             });
-        }
-        else {
-          // Unknown action—reply with error
+        } else {
           const errorResp: UnityResponse = {
             status: "error",
             message: "Unknown action"
@@ -228,11 +226,9 @@ async function doLspRename(oldSym: string, newSym: string) {
     match.location.range.start,
     newSym
   );
-  if (!edit) {throw new Error(`Rename of '${oldSym}' failed (no edits).`);
-}
+  if (!edit) {throw new Error(`Rename of '${oldSym}' failed (no edits).`);}
   const applied = await vscode.workspace.applyEdit(edit as vscode.WorkspaceEdit);
-  if (!applied) {throw new Error(`Rename of '${oldSym}' failed to apply.`);
-}
+  if (!applied) {throw new Error(`Rename of '${oldSym}' failed to apply.`);}
   await vscode.workspace.saveAll();
 }
 
@@ -247,9 +243,21 @@ function sendResponseToUnity(response: UnityResponse, port: number) {
   });
 }
 
+function writeTempFile(response: UnityResponse) {
+  const tempDir = path.join(require("os").tmpdir(), "vscode-scriptEdit");
+  try {
+    fs.mkdirSync(tempDir, { recursive: true });
+    const outPath = path.join(tempDir, `last_response.json`);
+    fs.writeFileSync(outPath, JSON.stringify(response, null, 2), "utf8");
+    console.log(`[scriptEdit] Wrote response to temp file: ${outPath}`);
+  } catch (err) {
+    console.error("[scriptEdit] Failed to write temp file:", err);
+  }
+}
+
 export function deactivate() {
   isDisposed = true;
   if (server) {
-    try { server.close(); } catch { /* no-op */ }
+    try { server.close(); } catch {}
   }
 }
