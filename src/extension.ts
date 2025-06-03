@@ -137,66 +137,54 @@ export function activate(context: vscode.ExtensionContext) {
     });
   }
 
-  (async () => {
-    const triedPorts = new Set<number>();
-    let attemptPort = DEFAULT_PORT;
+(async () => {
+  const triedPorts = new Set<number>();
+  const BASE_PORT = 39218;
+  const MAX_OFFSET = 100;
 
-    while (true) {
-      if (isDisposed) {
-        console.log("[scriptEdit] Activation disposed before binding; exiting.");
-        return;
-      }
+  for (let offset = 0; offset <= MAX_OFFSET; offset++) {
+    const attemptPort = BASE_PORT + offset;
+    triedPorts.add(attemptPort);
 
-      if (triedPorts.has(attemptPort)) {
-        if (triedPorts.size >= MAX_PORT - MIN_PORT + 1) {
-          console.error("[scriptEdit] No available ports left in 1024–65535.");
-          vscode.window.showErrorMessage(
-            "scriptEdit: could not bind any TCP port. Extension will not run."
-          );
-          return;
-        }
-        do {
-          attemptPort = Math.floor(Math.random() * (MAX_PORT - MIN_PORT + 1)) + MIN_PORT;
-        } while (triedPorts.has(attemptPort));
-      }
+    try {
+      server = await tryListen(attemptPort);
+      listeningPort = attemptPort;
+      console.log(`[scriptEdit] Listening on tcp://127.0.0.1:${listeningPort}`);
 
-      triedPorts.add(attemptPort);
+      server.on("error", (err) => {
+        console.error("[scriptEdit] Runtime server error:", err);
+      });
 
-      try {
-        server = await tryListen(attemptPort);
-        listeningPort = attemptPort;
-        console.log(`[scriptEdit] Listening on tcp://127.0.0.1:${listeningPort}`);
-
-        server.on("error", (err) => {
-          console.error("[scriptEdit] Runtime server error:", err);
-        });
-
-        context.subscriptions.push({
-          dispose: () => {
-            if (server) {
-              server.close();
-              console.log(`[scriptEdit] Closed listener on port ${listeningPort}`);
-            }
-          },
-        });
-
-        break;
-      } catch (err: any) {
-        if (err.code === "EADDRINUSE" || err.code === "EACCES") {
-          if (attemptPort === DEFAULT_PORT) {
-            attemptPort = Math.floor(Math.random() * (MAX_PORT - MIN_PORT + 1)) + MIN_PORT;
+      context.subscriptions.push({
+        dispose: () => {
+          if (server) {
+            server.close();
+            console.log(`[scriptEdit] Closed listener on port ${listeningPort}`);
           }
-          continue;
-        }
+        },
+      });
 
-        console.error("[scriptEdit] Unexpected bind error:", err);
-        vscode.window.showErrorMessage(
-          `scriptEdit: failed to bind TCP port (error: ${err.message}).`
-        );
-        return;
+      break;
+    } catch (err: any) {
+      if (err.code === "EADDRINUSE" || err.code === "EACCES") {
+        continue; // Try next port in the range
       }
+
+      console.error("[scriptEdit] Unexpected bind error:", err);
+      vscode.window.showErrorMessage(
+        `scriptEdit: failed to bind TCP port (error: ${err.message}).`
+      );
+      return;
     }
-  })();
+  }
+
+  if (!server) {
+    vscode.window.showErrorMessage(
+      "scriptEdit: could not bind any TCP port in range 39218–39318. Extension will not run."
+    );
+  }
+})();
+
 }
 
 async function handleRename(req: RenameRequest) {
