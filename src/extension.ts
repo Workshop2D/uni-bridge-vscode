@@ -70,6 +70,20 @@ export function activate(context: vscode.ExtensionContext) {
     });
   }
 
+  // Normalize a path: replace backslashes with forward slashes, remove trailing slash, lowercase on Windows
+  function normalizePath(p: string): string {
+    if (!p){ return p;}
+    let np = p.replace(/\\/g, "/");
+    if (np.endsWith("/")) {
+      np = np.slice(0, -1);
+    }
+    // On Windows, paths are case‐insensitive
+    if (process.platform === "win32") {
+      np = np.toLowerCase();
+    }
+    return np;
+  }
+
   function onSocket(socket: net.Socket) {
     let dataBuffer = "";
 
@@ -91,8 +105,11 @@ export function activate(context: vscode.ExtensionContext) {
 
         // ── 1) Handshake: verify projectRoot before replying ─────────────────────
         if (generic.action === "handshake") {
-          const reqRoot: string = generic.projectRoot ?? "";
-          const wsRoot: string = root;
+          const reqRootRaw: string = generic.projectRoot ?? "";
+          const wsRootRaw: string = root;
+
+          const reqRoot = normalizePath(reqRootRaw);
+          const wsRoot = normalizePath(wsRootRaw);
 
           if (!reqRoot) {
             const errorResp: UnityResponse = {
@@ -107,7 +124,7 @@ export function activate(context: vscode.ExtensionContext) {
           if (reqRoot !== wsRoot) {
             const errorResp: UnityResponse = {
               status: "error",
-              message: `Mismatched project root: '${wsRoot}' vs '${reqRoot}'`
+              message: `Mismatched project root: '${wsRootRaw}' vs '${reqRootRaw}'`
             };
             socket.write(JSON.stringify(errorResp) + "\n");
             socket.end();
@@ -117,7 +134,7 @@ export function activate(context: vscode.ExtensionContext) {
           const handshakeResponse: UnityResponse = {
             status: "ok",
             message: "handshake-ack",
-            projectRoot: wsRoot
+            projectRoot: wsRootRaw
           };
           socket.write(JSON.stringify(handshakeResponse) + "\n");
           socket.end();
@@ -127,14 +144,18 @@ export function activate(context: vscode.ExtensionContext) {
         // ── 2) Rename: as before, but reuse root for comparison ─────────────────────
         if (generic.action === "rename") {
           const req = generic as RenameRequest;
-          const currentRoot = root;
+          const currentRootRaw = root;
+          const currentRoot = normalizePath(currentRootRaw);
 
           (async () => {
             try {
-              if (req.projectRoot && currentRoot !== req.projectRoot) {
-                throw new Error(
-                  `Mismatched project root: '${currentRoot}' vs '${req.projectRoot}'`
-                );
+              if (req.projectRoot) {
+                const reqRootNorm = normalizePath(req.projectRoot);
+                if (reqRootNorm !== currentRoot) {
+                  throw new Error(
+                    `Mismatched project root: '${currentRootRaw}' vs '${req.projectRoot}'`
+                  );
+                }
               }
 
               await handleRename(req);
@@ -142,7 +163,7 @@ export function activate(context: vscode.ExtensionContext) {
               const okResp: UnityResponse = {
                 requestId: req.requestId,
                 status: "ok",
-                projectRoot: req.projectRoot ?? currentRoot,
+                projectRoot: req.projectRoot ?? currentRootRaw,
               };
               socket.write(JSON.stringify(okResp) + "\n");
               if (req.unityPort) {
@@ -157,7 +178,7 @@ export function activate(context: vscode.ExtensionContext) {
                 requestId: req.requestId,
                 status: "error",
                 message: msg,
-                projectRoot: req.projectRoot ?? currentRoot,
+                projectRoot: req.projectRoot ?? currentRootRaw,
               };
               socket.write(JSON.stringify(errorPayload) + "\n");
               if (req.unityPort) {
