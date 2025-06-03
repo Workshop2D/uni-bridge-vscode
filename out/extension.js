@@ -146,22 +146,10 @@ function activate(context) {
     }
     (async () => {
         const triedPorts = new Set();
-        let attemptPort = DEFAULT_PORT;
-        while (true) {
-            if (isDisposed) {
-                console.log("[scriptEdit] Activation disposed before binding; exiting.");
-                return;
-            }
-            if (triedPorts.has(attemptPort)) {
-                if (triedPorts.size >= MAX_PORT - MIN_PORT + 1) {
-                    console.error("[scriptEdit] No available ports left in 1024–65535.");
-                    vscode.window.showErrorMessage("scriptEdit: could not bind any TCP port. Extension will not run.");
-                    return;
-                }
-                do {
-                    attemptPort = Math.floor(Math.random() * (MAX_PORT - MIN_PORT + 1)) + MIN_PORT;
-                } while (triedPorts.has(attemptPort));
-            }
+        const BASE_PORT = 39218;
+        const MAX_OFFSET = 100;
+        for (let offset = 0; offset <= MAX_OFFSET; offset++) {
+            const attemptPort = BASE_PORT + offset;
             triedPorts.add(attemptPort);
             try {
                 server = await tryListen(attemptPort);
@@ -182,15 +170,15 @@ function activate(context) {
             }
             catch (err) {
                 if (err.code === "EADDRINUSE" || err.code === "EACCES") {
-                    if (attemptPort === DEFAULT_PORT) {
-                        attemptPort = Math.floor(Math.random() * (MAX_PORT - MIN_PORT + 1)) + MIN_PORT;
-                    }
-                    continue;
+                    continue; // Try next port in the range
                 }
                 console.error("[scriptEdit] Unexpected bind error:", err);
                 vscode.window.showErrorMessage(`scriptEdit: failed to bind TCP port (error: ${err.message}).`);
                 return;
             }
+        }
+        if (!server) {
+            vscode.window.showErrorMessage("scriptEdit: could not bind any TCP port in range 39218–39318. Extension will not run.");
         }
     })();
 }
