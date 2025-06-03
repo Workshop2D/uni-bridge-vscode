@@ -31,7 +31,6 @@ export function activate(context: vscode.ExtensionContext) {
   // 1. Check for Unity‐project signature (both Assets/ and ProjectSettings/ at workspace root)
   const workspaceFolders = vscode.workspace.workspaceFolders;
   if (!workspaceFolders || workspaceFolders.length === 0) {
-    // No folder open at all → bail
     console.log("[scriptEdit] No workspace folder open. Skipping TCP server startup.");
     return;
   }
@@ -40,7 +39,6 @@ export function activate(context: vscode.ExtensionContext) {
   const assetsFolder = path.join(root, "Assets");
   const projectSettingsFolder = path.join(root, "ProjectSettings");
   if (!fs.existsSync(assetsFolder) || !fs.existsSync(projectSettingsFolder)) {
-    // Not a Unity project → bail
     console.log(
       "[scriptEdit] Not a Unity project (missing Assets/ or ProjectSettings/). Skipping TCP server startup."
     );
@@ -91,16 +89,42 @@ export function activate(context: vscode.ExtensionContext) {
           continue;
         }
 
+        // ── 1) Handshake: verify projectRoot before replying ─────────────────────
         if (generic.action === "handshake") {
+          const reqRoot: string = generic.projectRoot ?? "";
+          const wsRoot: string = root;
+
+          if (!reqRoot) {
+            const errorResp: UnityResponse = {
+              status: "error",
+              message: "handshake missing projectRoot"
+            };
+            socket.write(JSON.stringify(errorResp) + "\n");
+            socket.end();
+            continue;
+          }
+
+          if (reqRoot !== wsRoot) {
+            const errorResp: UnityResponse = {
+              status: "error",
+              message: `Mismatched project root: '${wsRoot}' vs '${reqRoot}'`
+            };
+            socket.write(JSON.stringify(errorResp) + "\n");
+            socket.end();
+            continue;
+          }
+
           const handshakeResponse: UnityResponse = {
             status: "ok",
-            message: "handshake-ack"
+            message: "handshake-ack",
+            projectRoot: wsRoot
           };
           socket.write(JSON.stringify(handshakeResponse) + "\n");
           socket.end();
           continue;
         }
 
+        // ── 2) Rename: as before, but reuse root for comparison ─────────────────────
         if (generic.action === "rename") {
           const req = generic as RenameRequest;
           const currentRoot = root;
@@ -143,6 +167,7 @@ export function activate(context: vscode.ExtensionContext) {
             }
           })();
         } else {
+          // ── 3) Unknown action ────────────────────────────────────────────────────
           const errorResp: UnityResponse = {
             status: "error",
             message: "Unknown action"
