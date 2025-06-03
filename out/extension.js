@@ -43,6 +43,22 @@ let server = null;
 let listeningPort = null;
 let isDisposed = false;
 function activate(context) {
+    // 1. Check for Unity‐project signature (both Assets/ and ProjectSettings/ at workspace root)
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        // No folder open at all → bail
+        console.log("[scriptEdit] No workspace folder open. Skipping TCP server startup.");
+        return;
+    }
+    const root = workspaceFolders[0].uri.fsPath;
+    const assetsFolder = path.join(root, "Assets");
+    const projectSettingsFolder = path.join(root, "ProjectSettings");
+    if (!fs.existsSync(assetsFolder) || !fs.existsSync(projectSettingsFolder)) {
+        // Not a Unity project → bail
+        console.log("[scriptEdit] Not a Unity project (missing Assets/ or ProjectSettings/). Skipping TCP server startup.");
+        return;
+    }
+    // 2. Only now do we attempt to bind ports, knowing we’re in a Unity project
     const BASE_PORT = 39218;
     const MAX_OFFSET = 100;
     function tryListen(port) {
@@ -79,10 +95,8 @@ function activate(context) {
                 }
                 catch (e) {
                     console.error("[scriptEdit] JSON parse error:", e);
-                    // Cannot recover—ignore this line
                     continue;
                 }
-                // If it’s a “handshake” probe, answer immediately and close
                 if (generic.action === "handshake") {
                     const handshakeResponse = {
                         status: "ok",
@@ -92,19 +106,15 @@ function activate(context) {
                     socket.end();
                     continue;
                 }
-                // Otherwise, treat it as a “rename” request, but wrap everything in a big try/catch
                 if (generic.action === "rename") {
                     const req = generic;
-                    const currentRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
+                    const currentRoot = root;
                     (async () => {
                         try {
-                            // 1) Check projectRoot mismatch
                             if (req.projectRoot && currentRoot !== req.projectRoot) {
                                 throw new Error(`Mismatched project root: '${currentRoot}' vs '${req.projectRoot}'`);
                             }
-                            // 2) Perform rename steps
                             await handleRename(req);
-                            // 3) On success, send OK
                             const okResp = {
                                 requestId: req.requestId,
                                 status: "ok",
@@ -117,7 +127,6 @@ function activate(context) {
                             writeTempFile(okResp);
                         }
                         catch (err) {
-                            // Any exception ends up here
                             const msg = err instanceof Error ? err.stack || err.message : String(err);
                             console.error("[scriptEdit] Rename‐side error:", msg);
                             const errorPayload = {
@@ -126,19 +135,15 @@ function activate(context) {
                                 message: msg,
                                 projectRoot: req.projectRoot ?? currentRoot,
                             };
-                            // 4) Write error back to requesting socket
                             socket.write(JSON.stringify(errorPayload) + "\n");
-                            // 5) Also send back to Unity's callback port if provided
                             if (req.unityPort) {
                                 sendResponseToUnity(errorPayload, req.unityPort);
                             }
-                            // 6) Log to temp file for troubleshooting
                             writeTempFile(errorPayload);
                         }
                     })();
                 }
                 else {
-                    // Unknown action—reply with error
                     const errorResp = {
                         status: "error",
                         message: "Unknown action"
@@ -151,7 +156,7 @@ function activate(context) {
             console.error("[scriptEdit] Socket error:", err);
         });
     }
-    // Attempt to bind between BASE_PORT and BASE_PORT + MAX_OFFSET (inclusive)
+    // 3. Now that we know it’s a Unity project, bind a port in [39218..39318]
     (async () => {
         for (let offset = 0; offset <= MAX_OFFSET; offset++) {
             const attemptPort = BASE_PORT + offset;
@@ -170,7 +175,7 @@ function activate(context) {
                         }
                     },
                 });
-                return; // bound successfully; exit the loop
+                return;
             }
             catch (err) {
                 if (err.code === "EADDRINUSE" || err.code === "EACCES") {
@@ -181,20 +186,16 @@ function activate(context) {
                 return;
             }
         }
-        // If we get here, no port was found
         vscode.window.showErrorMessage("scriptEdit: could not bind any TCP port in range 39218–39318. Extension will not run.");
     })();
 }
 async function handleRename(req) {
-    // Namespace rename
     if (req.oldNamespace && req.newNamespace) {
         await doLspRename(req.oldNamespace, req.newNamespace);
     }
-    // Class rename
     if (req.oldClass && req.newClass) {
         await doLspRename(req.oldClass, req.newClass);
     }
-    // Open new file
     if (req.newFile) {
         const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(req.newFile));
         await vscode.window.showTextDocument(doc);
