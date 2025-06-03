@@ -79,6 +79,21 @@ function activate(context) {
             s.listen(port, "127.0.0.1");
         });
     }
+    // Normalize a path: replace backslashes with forward slashes, remove trailing slash, lowercase on Windows
+    function normalizePath(p) {
+        if (!p) {
+            return p;
+        }
+        let np = p.replace(/\\/g, "/");
+        if (np.endsWith("/")) {
+            np = np.slice(0, -1);
+        }
+        // On Windows, paths are case‐insensitive
+        if (process.platform === "win32") {
+            np = np.toLowerCase();
+        }
+        return np;
+    }
     function onSocket(socket) {
         let dataBuffer = "";
         socket.on("data", (chunk) => {
@@ -97,8 +112,10 @@ function activate(context) {
                 }
                 // ── 1) Handshake: verify projectRoot before replying ─────────────────────
                 if (generic.action === "handshake") {
-                    const reqRoot = generic.projectRoot ?? "";
-                    const wsRoot = root;
+                    const reqRootRaw = generic.projectRoot ?? "";
+                    const wsRootRaw = root;
+                    const reqRoot = normalizePath(reqRootRaw);
+                    const wsRoot = normalizePath(wsRootRaw);
                     if (!reqRoot) {
                         const errorResp = {
                             status: "error",
@@ -111,7 +128,7 @@ function activate(context) {
                     if (reqRoot !== wsRoot) {
                         const errorResp = {
                             status: "error",
-                            message: `Mismatched project root: '${wsRoot}' vs '${reqRoot}'`
+                            message: `Mismatched project root: '${wsRootRaw}' vs '${reqRootRaw}'`
                         };
                         socket.write(JSON.stringify(errorResp) + "\n");
                         socket.end();
@@ -120,7 +137,7 @@ function activate(context) {
                     const handshakeResponse = {
                         status: "ok",
                         message: "handshake-ack",
-                        projectRoot: wsRoot
+                        projectRoot: wsRootRaw
                     };
                     socket.write(JSON.stringify(handshakeResponse) + "\n");
                     socket.end();
@@ -129,17 +146,21 @@ function activate(context) {
                 // ── 2) Rename: as before, but reuse root for comparison ─────────────────────
                 if (generic.action === "rename") {
                     const req = generic;
-                    const currentRoot = root;
+                    const currentRootRaw = root;
+                    const currentRoot = normalizePath(currentRootRaw);
                     (async () => {
                         try {
-                            if (req.projectRoot && currentRoot !== req.projectRoot) {
-                                throw new Error(`Mismatched project root: '${currentRoot}' vs '${req.projectRoot}'`);
+                            if (req.projectRoot) {
+                                const reqRootNorm = normalizePath(req.projectRoot);
+                                if (reqRootNorm !== currentRoot) {
+                                    throw new Error(`Mismatched project root: '${currentRootRaw}' vs '${req.projectRoot}'`);
+                                }
                             }
                             await handleRename(req);
                             const okResp = {
                                 requestId: req.requestId,
                                 status: "ok",
-                                projectRoot: req.projectRoot ?? currentRoot,
+                                projectRoot: req.projectRoot ?? currentRootRaw,
                             };
                             socket.write(JSON.stringify(okResp) + "\n");
                             if (req.unityPort) {
@@ -154,7 +175,7 @@ function activate(context) {
                                 requestId: req.requestId,
                                 status: "error",
                                 message: msg,
-                                projectRoot: req.projectRoot ?? currentRoot,
+                                projectRoot: req.projectRoot ?? currentRootRaw,
                             };
                             socket.write(JSON.stringify(errorPayload) + "\n");
                             if (req.unityPort) {
