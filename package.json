@@ -2,7 +2,7 @@
   "name": "uni-bridge",
   "displayName": "UniBridge",
   "description": "TCP bridge between Unity and VS Code for seamless two‐way communication.",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "publisher": "workshop2d",
   "engines": {
     "vscode": "^1.100.0"
