@@ -28,9 +28,8 @@ let listeningPort: number | null = null;
 let isDisposed = false;
 
 export function activate(context: vscode.ExtensionContext) {
-  const DEFAULT_PORT = 39217;
-  const MIN_PORT = 1024;
-  const MAX_PORT = 65535;
+  const BASE_PORT = 39218;
+  const MAX_OFFSET = 100;
 
   function tryListen(port: number): Promise<net.Server> {
     return new Promise((resolve, reject) => {
@@ -69,9 +68,11 @@ export function activate(context: vscode.ExtensionContext) {
           generic = JSON.parse(message);
         } catch (e) {
           console.error("[scriptEdit] JSON parse error:", e);
+          // Cannot recover—ignore this line
           continue;
         }
 
+        // If it’s a “handshake” probe, answer immediately and close
         if (generic.action === "handshake") {
           const handshakeResponse: UnityResponse = {
             status: "ok",
@@ -82,21 +83,24 @@ export function activate(context: vscode.ExtensionContext) {
           continue;
         }
 
+        // Otherwise, treat it as a “rename” request, but wrap everything in a big try/catch
         if (generic.action === "rename") {
           const req = generic as RenameRequest;
           const currentRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
-          if (req.projectRoot && currentRoot !== req.projectRoot) {
-            const errorResp: UnityResponse = {
-              requestId: req.requestId,
-              status: "error",
-              message: `Mismatched project root: '${currentRoot}' vs '${req.projectRoot}'`,
-            };
-            socket.write(JSON.stringify(errorResp) + "\n");
-            continue;
-          }
 
-          handleRename(req)
-            .then(() => {
+          (async () => {
+            try {
+              // 1) Check projectRoot mismatch
+              if (req.projectRoot && currentRoot !== req.projectRoot) {
+                throw new Error(
+                  `Mismatched project root: '${currentRoot}' vs '${req.projectRoot}'`
+                );
+              }
+
+              // 2) Perform rename steps
+              await handleRename(req);
+
+              // 3) On success, send OK
               const okResp: UnityResponse = {
                 requestId: req.requestId,
                 status: "ok",
@@ -107,22 +111,33 @@ export function activate(context: vscode.ExtensionContext) {
                 sendResponseToUnity(okResp, req.unityPort);
               }
               writeTempFile(okResp);
-            })
-            .catch((renErr) => {
-              const msg = renErr instanceof Error ? renErr.message : String(renErr);
+            } catch (err) {
+              // Any exception ends up here
+              const msg = err instanceof Error ? err.stack || err.message : String(err);
+              console.error("[scriptEdit] Rename‐side error:", msg);
+
               const errorPayload: UnityResponse = {
                 requestId: req.requestId,
                 status: "error",
                 message: msg,
                 projectRoot: req.projectRoot ?? currentRoot,
               };
+
+              // 4) Write error back to requesting socket
               socket.write(JSON.stringify(errorPayload) + "\n");
+
+              // 5) Also send back to Unity's callback port if provided
               if (req.unityPort) {
                 sendResponseToUnity(errorPayload, req.unityPort);
               }
+
+              // 6) Log to temp file for troubleshooting
               writeTempFile(errorPayload);
-            });
+            }
+          })();
+
         } else {
+          // Unknown action—reply with error
           const errorResp: UnityResponse = {
             status: "error",
             message: "Unknown action"
@@ -137,63 +152,57 @@ export function activate(context: vscode.ExtensionContext) {
     });
   }
 
-(async () => {
-  const triedPorts = new Set<number>();
-  const BASE_PORT = 39218;
-  const MAX_OFFSET = 100;
+  // Attempt to bind between BASE_PORT and BASE_PORT + MAX_OFFSET (inclusive)
+  (async () => {
+    for (let offset = 0; offset <= MAX_OFFSET; offset++) {
+      const attemptPort = BASE_PORT + offset;
+      try {
+        server = await tryListen(attemptPort);
+        listeningPort = attemptPort;
+        console.log(`[scriptEdit] Listening on tcp://127.0.0.1:${listeningPort}`);
 
-  for (let offset = 0; offset <= MAX_OFFSET; offset++) {
-    const attemptPort = BASE_PORT + offset;
-    triedPorts.add(attemptPort);
+        server.on("error", (err) => {
+          console.error("[scriptEdit] Runtime server error:", err);
+        });
 
-    try {
-      server = await tryListen(attemptPort);
-      listeningPort = attemptPort;
-      console.log(`[scriptEdit] Listening on tcp://127.0.0.1:${listeningPort}`);
-
-      server.on("error", (err) => {
-        console.error("[scriptEdit] Runtime server error:", err);
-      });
-
-      context.subscriptions.push({
-        dispose: () => {
-          if (server) {
-            server.close();
-            console.log(`[scriptEdit] Closed listener on port ${listeningPort}`);
-          }
-        },
-      });
-
-      break;
-    } catch (err: any) {
-      if (err.code === "EADDRINUSE" || err.code === "EACCES") {
-        continue; // Try next port in the range
+        context.subscriptions.push({
+          dispose: () => {
+            if (server) {
+              server.close();
+              console.log(`[scriptEdit] Closed listener on port ${listeningPort}`);
+            }
+          },
+        });
+        return; // bound successfully; exit the loop
+      } catch (err: any) {
+        if (err.code === "EADDRINUSE" || err.code === "EACCES") {
+          continue; // try next port
+        }
+        console.error("[scriptEdit] Unexpected bind error:", err);
+        vscode.window.showErrorMessage(
+          `scriptEdit: failed to bind TCP port (error: ${err.message}).`
+        );
+        return;
       }
-
-      console.error("[scriptEdit] Unexpected bind error:", err);
-      vscode.window.showErrorMessage(
-        `scriptEdit: failed to bind TCP port (error: ${err.message}).`
-      );
-      return;
     }
-  }
 
-  if (!server) {
+    // If we get here, no port was found
     vscode.window.showErrorMessage(
       "scriptEdit: could not bind any TCP port in range 39218–39318. Extension will not run."
     );
-  }
-})();
-
+  })();
 }
 
 async function handleRename(req: RenameRequest) {
+  // Namespace rename
   if (req.oldNamespace && req.newNamespace) {
     await doLspRename(req.oldNamespace, req.newNamespace);
   }
+  // Class rename
   if (req.oldClass && req.newClass) {
     await doLspRename(req.oldClass, req.newClass);
   }
+  // Open new file
   if (req.newFile) {
     const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(req.newFile));
     await vscode.window.showTextDocument(doc);
@@ -206,7 +215,9 @@ async function doLspRename(oldSym: string, newSym: string) {
     oldSym
   )) ?? [];
   const match = symbols.find(si => si.name === oldSym);
-  if (!match) {throw new Error(`Symbol '${oldSym}' not found.`);}
+  if (!match) {
+    throw new Error(`Symbol '${oldSym}' not found.`);
+  }
 
   const edit = await vscode.commands.executeCommand(
     "vscode.executeDocumentRenameProvider",
@@ -214,9 +225,15 @@ async function doLspRename(oldSym: string, newSym: string) {
     match.location.range.start,
     newSym
   );
-  if (!edit) {throw new Error(`Rename of '${oldSym}' failed (no edits).`);}
+  if (!edit) {
+    throw new Error(`Rename of '${oldSym}' failed (no edits).`);
+  }
+
   const applied = await vscode.workspace.applyEdit(edit as vscode.WorkspaceEdit);
-  if (!applied) {throw new Error(`Rename of '${oldSym}' failed to apply.`);}
+  if (!applied) {
+    throw new Error(`Rename of '${oldSym}' failed to apply.`);
+  }
+
   await vscode.workspace.saveAll();
 }
 

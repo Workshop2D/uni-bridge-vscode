@@ -43,9 +43,8 @@ let server = null;
 let listeningPort = null;
 let isDisposed = false;
 function activate(context) {
-    const DEFAULT_PORT = 39217;
-    const MIN_PORT = 1024;
-    const MAX_PORT = 65535;
+    const BASE_PORT = 39218;
+    const MAX_OFFSET = 100;
     function tryListen(port) {
         return new Promise((resolve, reject) => {
             const s = net.createServer(onSocket);
@@ -80,8 +79,10 @@ function activate(context) {
                 }
                 catch (e) {
                     console.error("[scriptEdit] JSON parse error:", e);
+                    // Cannot recover—ignore this line
                     continue;
                 }
+                // If it’s a “handshake” probe, answer immediately and close
                 if (generic.action === "handshake") {
                     const handshakeResponse = {
                         status: "ok",
@@ -91,47 +92,53 @@ function activate(context) {
                     socket.end();
                     continue;
                 }
+                // Otherwise, treat it as a “rename” request, but wrap everything in a big try/catch
                 if (generic.action === "rename") {
                     const req = generic;
                     const currentRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
-                    if (req.projectRoot && currentRoot !== req.projectRoot) {
-                        const errorResp = {
-                            requestId: req.requestId,
-                            status: "error",
-                            message: `Mismatched project root: '${currentRoot}' vs '${req.projectRoot}'`,
-                        };
-                        socket.write(JSON.stringify(errorResp) + "\n");
-                        continue;
-                    }
-                    handleRename(req)
-                        .then(() => {
-                        const okResp = {
-                            requestId: req.requestId,
-                            status: "ok",
-                            projectRoot: req.projectRoot ?? currentRoot,
-                        };
-                        socket.write(JSON.stringify(okResp) + "\n");
-                        if (req.unityPort) {
-                            sendResponseToUnity(okResp, req.unityPort);
+                    (async () => {
+                        try {
+                            // 1) Check projectRoot mismatch
+                            if (req.projectRoot && currentRoot !== req.projectRoot) {
+                                throw new Error(`Mismatched project root: '${currentRoot}' vs '${req.projectRoot}'`);
+                            }
+                            // 2) Perform rename steps
+                            await handleRename(req);
+                            // 3) On success, send OK
+                            const okResp = {
+                                requestId: req.requestId,
+                                status: "ok",
+                                projectRoot: req.projectRoot ?? currentRoot,
+                            };
+                            socket.write(JSON.stringify(okResp) + "\n");
+                            if (req.unityPort) {
+                                sendResponseToUnity(okResp, req.unityPort);
+                            }
+                            writeTempFile(okResp);
                         }
-                        writeTempFile(okResp);
-                    })
-                        .catch((renErr) => {
-                        const msg = renErr instanceof Error ? renErr.message : String(renErr);
-                        const errorPayload = {
-                            requestId: req.requestId,
-                            status: "error",
-                            message: msg,
-                            projectRoot: req.projectRoot ?? currentRoot,
-                        };
-                        socket.write(JSON.stringify(errorPayload) + "\n");
-                        if (req.unityPort) {
-                            sendResponseToUnity(errorPayload, req.unityPort);
+                        catch (err) {
+                            // Any exception ends up here
+                            const msg = err instanceof Error ? err.stack || err.message : String(err);
+                            console.error("[scriptEdit] Rename‐side error:", msg);
+                            const errorPayload = {
+                                requestId: req.requestId,
+                                status: "error",
+                                message: msg,
+                                projectRoot: req.projectRoot ?? currentRoot,
+                            };
+                            // 4) Write error back to requesting socket
+                            socket.write(JSON.stringify(errorPayload) + "\n");
+                            // 5) Also send back to Unity's callback port if provided
+                            if (req.unityPort) {
+                                sendResponseToUnity(errorPayload, req.unityPort);
+                            }
+                            // 6) Log to temp file for troubleshooting
+                            writeTempFile(errorPayload);
                         }
-                        writeTempFile(errorPayload);
-                    });
+                    })();
                 }
                 else {
+                    // Unknown action—reply with error
                     const errorResp = {
                         status: "error",
                         message: "Unknown action"
@@ -144,13 +151,10 @@ function activate(context) {
             console.error("[scriptEdit] Socket error:", err);
         });
     }
+    // Attempt to bind between BASE_PORT and BASE_PORT + MAX_OFFSET (inclusive)
     (async () => {
-        const triedPorts = new Set();
-        const BASE_PORT = 39218;
-        const MAX_OFFSET = 100;
         for (let offset = 0; offset <= MAX_OFFSET; offset++) {
             const attemptPort = BASE_PORT + offset;
-            triedPorts.add(attemptPort);
             try {
                 server = await tryListen(attemptPort);
                 listeningPort = attemptPort;
@@ -166,29 +170,31 @@ function activate(context) {
                         }
                     },
                 });
-                break;
+                return; // bound successfully; exit the loop
             }
             catch (err) {
                 if (err.code === "EADDRINUSE" || err.code === "EACCES") {
-                    continue; // Try next port in the range
+                    continue; // try next port
                 }
                 console.error("[scriptEdit] Unexpected bind error:", err);
                 vscode.window.showErrorMessage(`scriptEdit: failed to bind TCP port (error: ${err.message}).`);
                 return;
             }
         }
-        if (!server) {
-            vscode.window.showErrorMessage("scriptEdit: could not bind any TCP port in range 39218–39318. Extension will not run.");
-        }
+        // If we get here, no port was found
+        vscode.window.showErrorMessage("scriptEdit: could not bind any TCP port in range 39218–39318. Extension will not run.");
     })();
 }
 async function handleRename(req) {
+    // Namespace rename
     if (req.oldNamespace && req.newNamespace) {
         await doLspRename(req.oldNamespace, req.newNamespace);
     }
+    // Class rename
     if (req.oldClass && req.newClass) {
         await doLspRename(req.oldClass, req.newClass);
     }
+    // Open new file
     if (req.newFile) {
         const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(req.newFile));
         await vscode.window.showTextDocument(doc);
