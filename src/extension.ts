@@ -3,18 +3,34 @@ import * as net from "net";
 import * as fs from "fs";
 import * as path from "path";
 
-interface RenameRequest {
-  action: "handshake" | "rename";
+// us 39218, unity 39217
+
+// --- Interfaces ---
+interface HandshakeRequest {
+  action: "handshake";
   requestId?: string;
+  unityPort: number;          // Port Unity listens on for responses
+  projectRoot: string;
+}
+
+// Inline rename fields for each batch entry
+interface RenameEntry {
   oldNamespace?: string;
   newNamespace?: string;
   oldClass?: string;
   newClass?: string;
-  oldFile?: string;
-  newFile?: string;
-  unityPort?: number;
-  projectRoot?: string;
+  oldFile?: string;          // Original file path (if file is being moved/renamed)
+  newFile?: string;          // New file path
 }
+
+interface BatchRenameRequest {
+  action: "batchRename";
+  requestId?: string;
+  projectRoot: string;
+  requests: RenameEntry[];  // Always an array, even for single
+}
+
+type ScriptEditRequest = HandshakeRequest | BatchRenameRequest;
 
 interface UnityResponse {
   requestId?: string;
@@ -23,12 +39,20 @@ interface UnityResponse {
   projectRoot?: string;
 }
 
+enum RenameSymbolKind {
+  Class = 5,
+  Namespace = 3,
+}
+
+// --- Module-level state ---
 let server: net.Server | null = null;
 let listeningPort: number | null = null;
-let isDisposed = false;
+let lastSeenUnityIP: string | null = null;
+let unityPort: number | null = null;   // port provided by Unity during handshake
 
 export function activate(context: vscode.ExtensionContext) {
-  // 1. Check for Unity‐project signature (both Assets/ and ProjectSettings/ at workspace root)
+  lastSeenUnityIP = "127.0.0.1";
+
   const workspaceFolders = vscode.workspace.workspaceFolders;
   if (!workspaceFolders || workspaceFolders.length === 0) {
     console.log("[scriptEdit] No workspace folder open. Skipping TCP server startup.");
@@ -39,20 +63,17 @@ export function activate(context: vscode.ExtensionContext) {
   const assetsFolder = path.join(root, "Assets");
   const projectSettingsFolder = path.join(root, "ProjectSettings");
   if (!fs.existsSync(assetsFolder) || !fs.existsSync(projectSettingsFolder)) {
-    console.log(
-      "[scriptEdit] Not a Unity project (missing Assets/ or ProjectSettings/). Skipping TCP server startup."
-    );
+    console.log("[scriptEdit] Not a Unity project (missing Assets/ or ProjectSettings/). Skipping TCP server startup.");
     return;
   }
 
-  // 2. Only now do we attempt to bind ports, knowing we’re in a Unity project
   const BASE_PORT = 39218;
-  const MAX_OFFSET = 100;
+  // MAX_OFFSET_UPWARDS defines how far to search above BASE_PORT (i.e. trying BASE_PORT + 0 up to BASE_PORT + MAX_OFFSET_UPWARDS)
+  const MAX_OFFSET_UPWARDS = 100;
 
   function tryListen(port: number): Promise<net.Server> {
     return new Promise((resolve, reject) => {
       const s = net.createServer(onSocket);
-
       s.once("error", (err: NodeJS.ErrnoException) => {
         if (err.code !== "EADDRINUSE" && err.code !== "EACCES") {
           console.error(`[scriptEdit] Unexpected listen() error on port ${port}:`, err);
@@ -60,158 +81,296 @@ export function activate(context: vscode.ExtensionContext) {
         try { s.close(); } catch {}
         reject(err);
       });
-
       s.once("listening", () => {
         s.removeAllListeners("error");
         resolve(s);
       });
-
       s.listen(port, "127.0.0.1");
     });
   }
 
-  // Normalize a path: replace backslashes with forward slashes, remove trailing slash, lowercase on Windows
   function normalizePath(p: string): string {
-    if (!p){ return p;}
+    if (!p) { return p; }
     let np = p.replace(/\\/g, "/");
     if (np.endsWith("/")) {
       np = np.slice(0, -1);
     }
-    // On Windows, paths are case‐insensitive
-    if (process.platform === "win32") {
-      np = np.toLowerCase();
+    return process.platform === "win32" ? np.toLowerCase() : np;
+  }
+
+  function sendUnityResponse(resp: UnityResponse) {  
+    if (!lastSeenUnityIP || unityPort === null) {
+      if (!lastSeenUnityIP && unityPort === null) {
+        console.warn("[scriptEdit] Cannot send UnityResponse: missing IP and port");
+      } else if (!lastSeenUnityIP) {
+        console.warn("[scriptEdit] Cannot send UnityResponse: missing IP");
+      } else {
+        console.warn("[scriptEdit] Cannot send UnityResponse: missing port");
+      }
+      return;
     }
-    return np;
+
+    console.warn("[scriptEdit] Sending response on port: " + unityPort);
+    const client = new net.Socket();
+    client.connect(unityPort, lastSeenUnityIP, () => {
+      const payload = JSON.stringify(resp) + "\n";
+      client.write(payload, (err) => {
+        if (err) {
+          console.error("[scriptEdit] Error writing UnityResponse:", err);
+        }
+        client.end();
+      });
+    });
+    client.on("error", (err) => {
+      console.error("[scriptEdit] Socket error when sending UnityResponse:", err);
+    });
+  }
+
+  async function handleRequest(socket: net.Socket, generic: any) {
+    // Wrap entire logic to catch unexpected errors
+    try {
+      // Check action field
+      if (!generic || typeof generic.action !== "string") {
+        const resp: UnityResponse = { status: "error", message: "Missing or invalid action field" };
+        sendUnityResponse(resp);
+        return;
+      }
+
+      // Normalize and validate projectRoot for both handshake and batchRename
+      const rawReq = normalizePath(generic.projectRoot ?? "");
+      const wsRoot = normalizePath(root);
+      const requestId = generic.requestId;
+
+      if (generic.action === "handshake") {
+        // Validate handshake payload
+        if (!rawReq) {
+          const msg = "Missing projectRoot for handshake";
+          console.warn(`[scriptEdit] ${msg}`);
+          const resp: UnityResponse = { status: "error", message: msg, requestId };
+          sendUnityResponse(resp);
+          return;
+        }
+        if (typeof generic.unityPort !== "number") {
+          const msg = "Missing or invalid unityPort for handshake";
+          console.warn(`[scriptEdit] ${msg}`);
+          const resp: UnityResponse = { status: "error", message: msg, requestId };
+          sendUnityResponse(resp);
+          return;
+        }
+        // Accept subfolders (e.g. Assets) as valid root
+        let reqRoot = rawReq;
+        const rel = path.relative(wsRoot, reqRoot);
+        if (!rel.startsWith("..")) {
+          reqRoot = wsRoot;
+        }
+        if (reqRoot !== wsRoot) {
+          const msg = `Mismatched project root: '${root}' vs '${generic.projectRoot}'`;
+          console.warn(`[scriptEdit] ${msg}`);
+          const resp: UnityResponse = { status: "error", message: msg, requestId };
+          sendUnityResponse(resp);
+          return;
+        }
+        // Handle handshake success
+        lastSeenUnityIP = socket.remoteAddress ?? null;
+        unityPort = generic.unityPort;
+        console.log(`[scriptEdit] Handshake from ${lastSeenUnityIP}:${unityPort}`);
+
+        // Build the response JSON:
+        const respObj: UnityResponse = {
+          status: "ok",
+          message: "handshake-ack",
+          projectRoot: root,
+          requestId
+        };
+        const respJson = JSON.stringify(respObj) + "\n";
+
+        // Send it immediately over the same socket:
+        socket.write(respJson, (err) => {
+          if (err) {
+            console.error("[scriptEdit] Error writing handshake‐reply on same socket:", err);
+          }
+          // (You can optionally end() the socket here if you don't expect anything more on it:)
+          socket.end();
+        });
+
+        return;
+
+      }
+
+      if (generic.action === "batchRename") {
+        // Validate batchRename payload
+        if (!rawReq) {
+          const msg = "Missing projectRoot for batchRename";
+          console.warn(`[scriptEdit] ${msg}`);
+          const resp: UnityResponse = { status: "error", message: msg, requestId };
+          sendUnityResponse(resp);
+          return;
+        }
+        // Accept subfolders as valid root
+        let reqRoot = rawReq;
+        const rel = path.relative(wsRoot, reqRoot);
+        if (!rel.startsWith("..")) {
+          reqRoot = wsRoot;
+        }
+        if (reqRoot !== wsRoot) {
+          const msg = `Mismatched project root: '${root}' vs '${generic.projectRoot}'`;
+          console.warn(`[scriptEdit] ${msg}`);
+          const resp: UnityResponse = { status: "error", message: msg, requestId };
+          sendUnityResponse(resp);
+          return;
+        }
+        if (!Array.isArray(generic.requests) || generic.requests.length === 0) {
+          const msg = "BatchRename request must include a non-empty requests array";
+          console.warn(`[scriptEdit] ${msg}`);
+          const resp: UnityResponse = { status: "error", message: msg, requestId };
+          sendUnityResponse(resp);
+          return;
+        }
+
+        // Perform all renames
+        // Collect file rename operations for later
+        const editedFilesSet = new Set<string>();
+        const fileRenameQueue: { oldFile: string, newFile: string }[] = [];
+        
+        // Perform all symbol renames (namespace/class) first
+        for (let idx = 0; idx < generic.requests.length; idx++) {
+          const req: RenameEntry = generic.requests[idx];
+
+          if (!req.oldNamespace && !req.newNamespace && !req.oldClass && !req.newClass && !req.newFile) {
+            const msg = `Rename entry at index ${idx} has no valid rename fields`;
+            console.warn(`[scriptEdit] ${msg}`);
+            const resp: UnityResponse = { status: "error", message: msg, requestId };
+            sendUnityResponse(resp);
+            return;
+          }
+
+          // Namespace rename
+          if (req.oldNamespace && req.newNamespace) {
+            try {
+              await doLspRename(req.oldNamespace, req.newNamespace, vscode.SymbolKind.Namespace, req.oldFile);
+            } catch (e) {
+              const msg = `Namespace rename failed for '${req.oldNamespace}' -> '${req.newNamespace}': ${e instanceof Error ? e.message : String(e)}`;
+              console.error(`[scriptEdit] ${msg}`);
+              const resp: UnityResponse = { status: "error", message: msg, requestId };
+              sendUnityResponse(resp);
+              return;
+            }
+          }
+
+          // Class rename
+          if (req.oldClass && req.newClass) {
+            try {
+              await doLspRename(req.oldClass, req.newClass, vscode.SymbolKind.Class, req.oldFile);
+            } catch (e) {
+              const msg = `Class rename failed for '${req.oldClass}' -> '${req.newClass}': ${e instanceof Error ? e.message : String(e)}`;
+              console.error(`[scriptEdit] ${msg}`);
+              const resp: UnityResponse = { status: "error", message: msg, requestId };
+              sendUnityResponse(resp);
+              return;
+            }
+          }
+
+          // Collect file rename to do later
+          if (req.oldFile && req.newFile) {
+            fileRenameQueue.push({ oldFile: req.oldFile, newFile: req.newFile });
+          } else if (req.newFile) {
+            // Only newFile provided: open it directly
+            try {
+              const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(req.newFile));
+              await vscode.window.showTextDocument(doc);
+            } catch (openErr) {
+              const msg = `Open file failed for '${req.newFile}': ${openErr instanceof Error ? openErr.message : String(openErr)}`;
+              console.warn(`[scriptEdit] ${msg}`);
+              const resp: UnityResponse = { status: "error", message: msg, requestId };
+              sendUnityResponse(resp);
+              return;
+            }
+          }
+        }
+
+        // After all class/namespace renames, perform file renames
+        for (const { oldFile, newFile } of fileRenameQueue) {
+          const oldUri = vscode.Uri.file(oldFile);
+          const newUri = vscode.Uri.file(newFile);
+          try {
+            await vscode.workspace.fs.rename(oldUri, newUri);
+            console.log(`[scriptEdit] File renamed from '${oldFile}' to '${newFile}'`);
+          } catch (fsErr) {
+            const msg = `File rename error for '${oldFile}' -> '${newFile}': ${fsErr instanceof Error ? fsErr.message : String(fsErr)}`;
+            console.error(`[scriptEdit] ${msg}`);
+            const resp: UnityResponse = { status: "error", message: msg, requestId };
+            sendUnityResponse(resp);
+            return;
+          }
+
+          try {
+            const doc = await vscode.workspace.openTextDocument(newUri);
+            await vscode.window.showTextDocument(doc);
+          } catch (openErr) {
+            console.warn(`[scriptEdit] Open file failed for '${newFile}': ${openErr}`);
+            // Not fatal
+          }
+        }
+
+        // All entries succeeded
+        const resp: UnityResponse = { status: "ok", requestId };
+        sendUnityResponse(resp);
+
+        return;
+      }
+
+      // Unknown action
+      const msg = `Unknown action '${generic.action}'`;
+      console.warn(`[scriptEdit] ${msg}`);
+      const resp: UnityResponse = { status: "error", message: msg, requestId };
+      sendUnityResponse(resp);
+    } catch (err) {
+      const msg = `Unexpected error: ${err instanceof Error ? err.message : String(err)}`;
+      console.error(`[scriptEdit] ${msg}`);
+      const resp: UnityResponse = { status: "error", message: msg, requestId: (generic && generic.requestId) };
+      sendUnityResponse(resp);
+    }
   }
 
   function onSocket(socket: net.Socket) {
+    console.log("[scriptEdit] New client connection from", socket.remoteAddress);
     let dataBuffer = "";
 
     socket.on("data", (chunk) => {
       dataBuffer += chunk.toString();
       let newlineIndex: number;
-
       while ((newlineIndex = dataBuffer.indexOf("\n")) !== -1) {
         const message = dataBuffer.slice(0, newlineIndex);
         dataBuffer = dataBuffer.slice(newlineIndex + 1);
-
-        let generic: any;
+        console.log("[scriptEdit] Raw incoming message:", message);
+        let parsed: ScriptEditRequest;
         try {
-          generic = JSON.parse(message);
+          parsed = JSON.parse(message) as ScriptEditRequest;
         } catch (e) {
-          console.error("[scriptEdit] JSON parse error:", e);
+          const msg = `[scriptEdit] JSON parse error: ${e}`;
+          console.error(msg);
+          const resp: UnityResponse = { status: "error", message: msg };
+          sendUnityResponse(resp);
           continue;
         }
-
-        // ── 1) Handshake: verify projectRoot before replying ─────────────────────
-        if (generic.action === "handshake") {
-          const reqRootRaw: string = generic.projectRoot ?? "";
-          const wsRootRaw: string = root;
-
-          const reqRoot = normalizePath(reqRootRaw);
-          const wsRoot = normalizePath(wsRootRaw);
-
-          if (!reqRoot) {
-            const errorResp: UnityResponse = {
-              status: "error",
-              message: "handshake missing projectRoot"
-            };
-            socket.write(JSON.stringify(errorResp) + "\n");
-            socket.end();
-            continue;
-          }
-
-          if (reqRoot !== wsRoot) {
-            const errorResp: UnityResponse = {
-              status: "error",
-              message: `Mismatched project root: '${wsRootRaw}' vs '${reqRootRaw}'`
-            };
-            socket.write(JSON.stringify(errorResp) + "\n");
-            socket.end();
-            continue;
-          }
-
-          // Normalize extension’s workspace root to match Unity’s style:
-          let wsRootNorm = root.replace(/\\/g, "/").replace(/\/$/, "");
-          wsRootNorm = wsRootNorm.toLowerCase();
-
-          const handshakeResponse: UnityResponse = {
-            status: "ok",
-            message: "handshake-ack",
-            projectRoot: wsRootNorm
-          };
-          socket.write(JSON.stringify(handshakeResponse) + "\n");
-
-          continue;
-        }
-
-        // ── 2) Rename: as before, but reuse root for comparison ─────────────────────
-        if (generic.action === "rename") {
-          const req = generic as RenameRequest;
-          const currentRootRaw = root;
-          const currentRoot = normalizePath(currentRootRaw);
-
-          (async () => {
-            try {
-              if (req.projectRoot) {
-                const reqRootNorm = normalizePath(req.projectRoot);
-                if (reqRootNorm !== currentRoot) {
-                  throw new Error(
-                    `Mismatched project root: '${currentRootRaw}' vs '${req.projectRoot}'`
-                  );
-                }
-              }
-
-              await handleRename(req);
-
-              const okResp: UnityResponse = {
-                requestId: req.requestId,
-                status: "ok",
-                projectRoot: req.projectRoot ?? currentRootRaw,
-              };
-              socket.write(JSON.stringify(okResp) + "\n");
-              if (req.unityPort) {
-                sendResponseToUnity(okResp, req.unityPort);
-              }
-              writeTempFile(okResp);
-            } catch (err) {
-              const msg = err instanceof Error ? err.stack || err.message : String(err);
-              console.error("[scriptEdit] Rename‐side error:", msg);
-
-              const errorPayload: UnityResponse = {
-                requestId: req.requestId,
-                status: "error",
-                message: msg,
-                projectRoot: req.projectRoot ?? currentRootRaw,
-              };
-              socket.write(JSON.stringify(errorPayload) + "\n");
-              if (req.unityPort) {
-                sendResponseToUnity(errorPayload, req.unityPort);
-              }
-              writeTempFile(errorPayload);
-            }
-          })();
-        } else {
-          // ── 3) Unknown action ────────────────────────────────────────────────────
-          const errorResp: UnityResponse = {
-            status: "error",
-            message: "Unknown action"
-          };
-          socket.write(JSON.stringify(errorResp) + "\n");
-        }
+        handleRequest(socket, parsed);
       }
     });
 
     socket.on("error", (err) => {
       console.error("[scriptEdit] Socket error:", err);
     });
+
+    socket.on("close", () => {
+      console.log("[scriptEdit] Client disconnected.");
+    });
   }
 
-  // 3. Now that we know it’s a Unity project, bind a port in [39218..39318]
+  // Attempt to bind server
   (async () => {
-    for (let offset = 0; offset <= MAX_OFFSET; offset++) {
-      const attemptPort = BASE_PORT + offset;
+    for (let offset = 0; offset <= MAX_OFFSET_UPWARDS; offset++) {
       try {
+        const attemptPort = BASE_PORT + offset;
         server = await tryListen(attemptPort);
         listeningPort = attemptPort;
         console.log(`[scriptEdit] Listening on tcp://127.0.0.1:${listeningPort}`);
@@ -230,90 +389,82 @@ export function activate(context: vscode.ExtensionContext) {
         });
         return;
       } catch (err: any) {
-        if (err.code === "EADDRINUSE" || err.code === "EACCES") {
-          continue; // try next port
+        if (err.code !== "EADDRINUSE" && err.code !== "EACCES") {
+          vscode.window.showErrorMessage(`scriptEdit: failed to bind TCP port: ${err.message}`);
+          return;
         }
-        console.error("[scriptEdit] Unexpected bind error:", err);
-        vscode.window.showErrorMessage(
-          `scriptEdit: failed to bind TCP port (error: ${err.message}).`
-        );
-        return;
       }
     }
-
-    vscode.window.showErrorMessage(
-      "scriptEdit: could not bind any TCP port in range 39218–39318. Extension will not run."
-    );
+    vscode.window.showErrorMessage("scriptEdit: could not bind any TCP port in range 39218–39318. Extension will not run.");
   })();
 }
 
-async function handleRename(req: RenameRequest) {
-  if (req.oldNamespace && req.newNamespace) {
-    await doLspRename(req.oldNamespace, req.newNamespace);
-  }
-  if (req.oldClass && req.newClass) {
-    await doLspRename(req.oldClass, req.newClass);
-  }
-  if (req.newFile) {
-    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(req.newFile));
-    await vscode.window.showTextDocument(doc);
-  }
-}
+async function doLspRename(
+  oldSym: string,
+  newSym: string,
+  kind: vscode.SymbolKind,
+  expectedFilePath?: string
+) : Promise<vscode.Uri[]> {
+  console.log(`[doLspRename] Attempting to rename ${vscode.SymbolKind[kind]} '${oldSym}' to '${newSym}'`);
 
-async function doLspRename(oldSym: string, newSym: string) {
   const symbols = (await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
     "vscode.executeWorkspaceSymbolProvider",
     oldSym
   )) ?? [];
-  const match = symbols.find(si => si.name === oldSym);
-  if (!match) {
-    throw new Error(`Symbol '${oldSym}' not found.`);
+
+  console.log(`[doLspRename] Found ${symbols.length} symbols for '${oldSym}'`);
+
+  for (const si of symbols) {
+    console.log(`[doLspRename] Candidate: name='${si.name}', kind=${vscode.SymbolKind[si.kind]}, file=${si.location.uri.fsPath}`);
   }
 
-  const edit = await vscode.commands.executeCommand(
-    "vscode.executeDocumentRenameProvider",
+  const normalizedExpectedPath = expectedFilePath?.replace(/\\/g, "/").toLowerCase();
+
+  const filtered = symbols.filter(si =>
+    si.kind === kind &&
+    (!normalizedExpectedPath || si.location.uri.fsPath.replace(/\\/g, "/").toLowerCase() === normalizedExpectedPath)
+  );
+
+  if (filtered.length === 0) {
+    throw new Error(`${vscode.SymbolKind[kind]} symbol '${oldSym}' not found${expectedFilePath ? ` in file '${expectedFilePath}'` : ''}.`);
+  }
+
+  const match = filtered[0];
+
+  console.log(`[doLspRename] Matched ${vscode.SymbolKind[kind]}: '${match.name}' in '${match.location.uri.fsPath}'`);
+
+  try {
+  const edit = await vscode.commands.executeCommand<vscode.WorkspaceEdit>(
+    'vscode.executeDocumentRenameProvider',
     match.location.uri,
     match.location.range.start,
     newSym
   );
-  if (!edit) {
-    throw new Error(`Rename of '${oldSym}' failed (no edits).`);
-  }
 
-  const applied = await vscode.workspace.applyEdit(edit as vscode.WorkspaceEdit);
-  if (!applied) {
-    throw new Error(`Rename of '${oldSym}' failed to apply.`);
-  }
 
-  await vscode.workspace.saveAll();
+  if (edit) {
+    const success = await vscode.workspace.applyEdit(edit);
+    if (success) {
+      console.log('[doLspRename] Rename applied successfully.');
+    } else {
+      console.error('[doLspRename] Failed to apply rename edit.');
+    }
+  } else {
+    console.warn('[doLspRename] No edits returned from rename provider.');
+  }
+} catch (e) {
+  console.error(`[doLspRename] Rename command failed: ${e instanceof Error ? e.message : String(e)}`);
+  throw e;
 }
 
-function sendResponseToUnity(response: UnityResponse, port: number) {
-  const client = new net.Socket();
-  client.connect(port, "127.0.0.1", () => {
-    client.write(JSON.stringify(response) + "\n");
-    client.end();
-  });
-  client.on("error", (err) => {
-    console.error("[scriptEdit] Send‐back error:", err);
-  });
-}
-
-function writeTempFile(response: UnityResponse) {
-  const tempDir = path.join(require("os").tmpdir(), "vscode-scriptEdit");
-  try {
-    fs.mkdirSync(tempDir, { recursive: true });
-    const outPath = path.join(tempDir, `last_response.json`);
-    fs.writeFileSync(outPath, JSON.stringify(response, null, 2), "utf8");
-    console.log(`[scriptEdit] Wrote response to temp file: ${outPath}`);
-  } catch (err) {
-    console.error("[scriptEdit] Failed to write temp file:", err);
+  // Collect all distinct URIs that were edited
+  // workspaceEdit.entries() returns a map from Uri.toString() -> TextEdit[]
+  const editedUris: vscode.Uri[] = [];
+  for (const [uriString, edits] of Object.entries(workspaceEdit.entries())) {
+    // Convert the key (string) back to a Uri
+    const fileUri = vscode.Uri.parse(uriString);
+    editedUris.push(fileUri);
   }
-}
 
-export function deactivate() {
-  isDisposed = true;
-  if (server) {
-    try { server.close(); } catch {}
-  }
+return editedUris;
 }
