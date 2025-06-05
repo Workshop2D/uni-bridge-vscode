@@ -247,46 +247,62 @@ export function activate(context: vscode.ExtensionContext) {
           // Namespace rename
           if (req.oldNamespace && req.newNamespace) {
             try {
-              await doLspRename(req.oldNamespace, req.newNamespace, vscode.SymbolKind.Namespace, req.oldFile);
+              const editedUris = await doLspRename(req.oldNamespace, req.newNamespace, vscode.SymbolKind.Namespace, req.oldFile);
+              editedUris.forEach(u => editedFilesSet.add(u.fsPath));
             } catch (e) {
               const msg = `Namespace rename failed for '${req.oldNamespace}' -> '${req.newNamespace}': ${e instanceof Error ? e.message : String(e)}`;
               console.error(`[scriptEdit] ${msg}`);
               const resp: UnityResponse = { status: "error", message: msg, requestId };
               sendUnityResponse(resp);
-              return;
             }
           }
 
           // Class rename
           if (req.oldClass && req.newClass) {
             try {
-              await doLspRename(req.oldClass, req.newClass, vscode.SymbolKind.Class, req.oldFile);
+              const editedUris = await doLspRename(req.oldClass, req.newClass, vscode.SymbolKind.Class, req.oldFile);
+              editedUris.forEach(u => editedFilesSet.add(u.fsPath));
             } catch (e) {
               const msg = `Class rename failed for '${req.oldClass}' -> '${req.newClass}': ${e instanceof Error ? e.message : String(e)}`;
               console.error(`[scriptEdit] ${msg}`);
               const resp: UnityResponse = { status: "error", message: msg, requestId };
               sendUnityResponse(resp);
-              return;
             }
           }
 
           // Collect file rename to do later
           if (req.oldFile && req.newFile) {
             fileRenameQueue.push({ oldFile: req.oldFile, newFile: req.newFile });
-          } else if (req.newFile) {
-            // Only newFile provided: open it directly
-            try {
-              const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(req.newFile));
-              await vscode.window.showTextDocument(doc);
-            } catch (openErr) {
-              const msg = `Open file failed for '${req.newFile}': ${openErr instanceof Error ? openErr.message : String(openErr)}`;
-              console.warn(`[scriptEdit] ${msg}`);
-              const resp: UnityResponse = { status: "error", message: msg, requestId };
-              sendUnityResponse(resp);
-              return;
-            }
+            console.warn("Pushing file to rename later");
           }
         }
+        
+        console.log(
+          `[scriptEdit] Completed namespace and class rename loop.`
+        );
+        // …inside your batchRename handler, after all doLspRename calls and after
+        // you’ve pushed into fileRenameQueue…
+
+        // DEBUG: How many files did LSP edits touch, and what are they?
+        const editedArray = Array.from(editedFilesSet);
+        console.log(
+          `[scriptEdit] editedFilesSet size=${editedFilesSet.size}. Contents:`,
+          editedArray
+        );
+
+        // DEBUG: How many file‐move operations are queued, and what are they?
+        console.log(
+          `[scriptEdit] fileRenameQueue length=${fileRenameQueue.length}. Contents:`,
+          fileRenameQueue
+        );
+
+        // Now you can save or rename.
+        //
+        // await saveEditedFiles(editedFilesSet);
+        // for (const { oldFile, newFile } of fileRenameQueue) { … }
+
+        
+        await saveEditedFiles(editedFilesSet);
 
         // After all class/namespace renames, perform file renames
         for (const { oldFile, newFile } of fileRenameQueue) {
@@ -399,72 +415,140 @@ export function activate(context: vscode.ExtensionContext) {
   })();
 }
 
-async function doLspRename(
+export async function doLspRename(
   oldSym: string,
   newSym: string,
   kind: vscode.SymbolKind,
   expectedFilePath?: string
-) : Promise<vscode.Uri[]> {
-  console.log(`[doLspRename] Attempting to rename ${vscode.SymbolKind[kind]} '${oldSym}' to '${newSym}'`);
+): Promise<vscode.Uri[]> {
+  console.log(
+    `[doLspRename] Attempting to rename ${vscode.SymbolKind[kind]} '${oldSym}' to '${newSym}'`
+  );
 
+  // 1) Find all workspace symbols matching oldSym
   const symbols = (await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
     "vscode.executeWorkspaceSymbolProvider",
     oldSym
   )) ?? [];
 
   console.log(`[doLspRename] Found ${symbols.length} symbols for '${oldSym}'`);
-
   for (const si of symbols) {
-    console.log(`[doLspRename] Candidate: name='${si.name}', kind=${vscode.SymbolKind[si.kind]}, file=${si.location.uri.fsPath}`);
+    console.log(
+      `[doLspRename] Candidate: name='${si.name}', kind=${vscode.SymbolKind[si.kind]}, file=${si.location.uri.fsPath}`
+    );
   }
 
-  const normalizedExpectedPath = expectedFilePath?.replace(/\\/g, "/").toLowerCase();
-
-  const filtered = symbols.filter(si =>
-    si.kind === kind &&
-    (!normalizedExpectedPath || si.location.uri.fsPath.replace(/\\/g, "/").toLowerCase() === normalizedExpectedPath)
+  // 2) Filter by kind + optional expectedFilePath
+  const normalizedExpectedPath = expectedFilePath
+    ?.replace(/\\/g, "/")
+    .toLowerCase();
+  const filtered = symbols.filter(
+    si =>
+      si.kind === kind &&
+      (!normalizedExpectedPath ||
+        si.location.uri.fsPath.replace(/\\/g, "/").toLowerCase() ===
+          normalizedExpectedPath)
   );
 
   if (filtered.length === 0) {
-    throw new Error(`${vscode.SymbolKind[kind]} symbol '${oldSym}' not found${expectedFilePath ? ` in file '${expectedFilePath}'` : ''}.`);
+    throw new Error(
+      `${vscode.SymbolKind[kind]} symbol '${oldSym}' not found${
+        expectedFilePath ? ` in file '${expectedFilePath}'` : ""
+      }.`
+    );
   }
 
   const match = filtered[0];
-
-  console.log(`[doLspRename] Matched ${vscode.SymbolKind[kind]}: '${match.name}' in '${match.location.uri.fsPath}'`);
-
-  try {
-  const edit = await vscode.commands.executeCommand<vscode.WorkspaceEdit>(
-    'vscode.executeDocumentRenameProvider',
-    match.location.uri,
-    match.location.range.start,
-    newSym
+  console.log(
+    `[doLspRename] Matched ${vscode.SymbolKind[kind]}: '${match.name}' in '${match.location.uri.fsPath}'`
   );
 
-
-  if (edit) {
-    const success = await vscode.workspace.applyEdit(edit);
-    if (success) {
-      console.log('[doLspRename] Rename applied successfully.');
-    } else {
-      console.error('[doLspRename] Failed to apply rename edit.');
-    }
-  } else {
-    console.warn('[doLspRename] No edits returned from rename provider.');
+  // 3) Invoke the DocumentRenameProvider and get a WorkspaceEdit
+  let workspaceEdit: vscode.WorkspaceEdit | undefined;
+  try {
+    workspaceEdit = await vscode.commands.executeCommand<vscode.WorkspaceEdit>(
+      "vscode.executeDocumentRenameProvider",
+      match.location.uri,
+      match.location.range.start,
+      newSym
+    );
+  } catch (e) {
+    console.error(
+      `[doLspRename] Rename command failed: ${
+        e instanceof Error ? e.message : String(e)
+      }`
+    );
+    throw e;
   }
-} catch (e) {
-  console.error(`[doLspRename] Rename command failed: ${e instanceof Error ? e.message : String(e)}`);
-  throw e;
-}
 
-  // Collect all distinct URIs that were edited
-  // workspaceEdit.entries() returns a map from Uri.toString() -> TextEdit[]
+  if (!workspaceEdit) {
+    console.warn("[doLspRename] No edits returned from rename provider.");
+    return [];
+  }
+
+  // 4) Apply the WorkspaceEdit
+  const applied = await vscode.workspace.applyEdit(workspaceEdit);
+  if (!applied) {
+    console.error("[doLspRename] Failed to apply rename edit.");
+    return [];
+  }
+  console.log("[doLspRename] Rename applied successfully.");
+
+  // 5) Collect all distinct URIs that the WorkspaceEdit touched
   const editedUris: vscode.Uri[] = [];
-  for (const [uriString, edits] of Object.entries(workspaceEdit.entries())) {
-    // Convert the key (string) back to a Uri
-    const fileUri = vscode.Uri.parse(uriString);
+  for (const [fileUri, _edits] of workspaceEdit.entries()) {
+    // fileUri is already a vscode.Uri, so just push it
     editedUris.push(fileUri);
   }
 
-return editedUris;
+  return editedUris;
+}
+
+/**
+ * Given a set of file system paths (fsPaths) that were edited,
+ * ensure each one is saved. Logs every save action.
+ * If a document is already open and dirty, saves it in its existing tab.
+ * If it’s not open, opens it in the background (no visible editor) and saves if dirty.
+ */
+export async function saveEditedFiles(
+  editedFilePaths: Set<string>
+): Promise<void> {
+  for (const fsPath of editedFilePaths) {
+    try {
+      // 1) Check if this file is already open in any TextDocument
+      const alreadyOpen = vscode.workspace.textDocuments.find(
+        (doc) => doc.uri.fsPath === fsPath
+      );
+
+      if (alreadyOpen) {
+        if (alreadyOpen.isDirty) {
+          console.log(`[saveEditedFiles] Saving (open) '${fsPath}'`);
+          await alreadyOpen.save();
+        } else {
+          console.log(`[saveEditedFiles] Already open but not dirty: '${fsPath}'`);
+        }
+      } else {
+        // 2) Not open: open in background (no UI) and then save if dirty
+        console.log(`[saveEditedFiles] Opening in background: '${fsPath}'`);
+        const doc = await vscode.workspace.openTextDocument(
+          vscode.Uri.file(fsPath)
+        );
+
+        if (doc.isDirty) {
+          console.log(`[saveEditedFiles] Saving (background) '${fsPath}'`);
+          await doc.save();
+        } else {
+          console.log(`[saveEditedFiles] Opened in background but not dirty: '${fsPath}'`);
+        }
+        // We do not call showTextDocument, so no tab actually pops up.
+      }
+    } catch (err) {
+      console.warn(
+        `[saveEditedFiles] Could not save '${fsPath}': ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+      // Continue with the rest even if one file fails
+    }
+  }
 }
